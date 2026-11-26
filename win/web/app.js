@@ -39,7 +39,7 @@ function hint(msg, kind) {
   hintEl.className = 'hint' + (kind ? ' ' + kind : '');
 }
 
-async function api(path, body, timeoutMs = 90000) {
+async function api(path, body, timeoutMs = 90000, retries = 1) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -52,8 +52,15 @@ async function api(path, body, timeoutMs = 90000) {
     const text = await r.text();
     return text ? JSON.parse(text) : {};
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + ' 秒）');
-    throw e;
+    if (e.name === 'AbortError') {
+      throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + ' 秒）');
+    }
+    // 连接被回收 / 服务刚重启时重试一次
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, 250));
+      return api(path, body, timeoutMs, retries - 1);
+    }
+    throw new Error('连不上本机服务，请确认程序仍在运行（' + e.message + '）');
   } finally {
     clearTimeout(timer);
   }
@@ -385,7 +392,8 @@ $('clip-add').onclick = async () => {
   if (!links.length) return;
   try {
     const j = await api('/api/add-many', { urls: links }, 60000);
-    hint(`已添加 ${j.added || 0} 个任务`, j.added ? 'ok' : 'bad');
+    if (j.added) hint(`已添加 ${j.added} 个任务`, 'ok');
+    else hint((j.errors && j.errors[0]) || '没有可添加的链接', 'bad');
     await api('/api/clipboard', {}, 8000);
     poll();
   } catch (e) {

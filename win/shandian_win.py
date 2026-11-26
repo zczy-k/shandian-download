@@ -65,7 +65,7 @@ GOPEED_NAME = "gopeed.exe"
 YTDLP_NAME = "yt-dlp.exe"
 FFMPEG_NAME = "ffmpeg.exe"
 
-APP_VERSION = "0.23.0"
+APP_VERSION = "0.23.1"
 GATEWAY_PORT = 6800
 UI_PORT = 8765
 
@@ -262,6 +262,7 @@ DEFAULT_CONFIG = {
     "schedule_from": 0,
     "schedule_to": 0,
     "auto_update_check": True,
+    "auto_resume": True,
     "recycle": [],
     "seen_version": "",
 }
@@ -939,6 +940,39 @@ def schedule_worker() -> None:
             SCHEDULE_STATE["active"] = False
 
 
+# --------------------------------------------------------------------------- 启动恢复
+
+
+def auto_resume_unfinished() -> None:
+    """内核重启后会把未完成任务置为暂停，这里把它们接回去。
+
+    已完成的（进度等于总大小）不动，避免把 done 的任务重新拉起来。
+    """
+    time.sleep(1.5)
+    if not CONFIG.get("auto_resume", True) or not ENGINE.alive:
+        return
+    try:
+        tasks = ENGINE.tasks()
+    except Exception:
+        return
+    resumed = 0
+    for t in tasks:
+        if (t.get("status") or "").lower() not in ("pause", "paused"):
+            continue
+        res = (t.get("meta") or {}).get("res") or {}
+        size = int(res.get("size") or 0)
+        done = int((t.get("progress") or {}).get("downloaded") or 0)
+        if size and done >= size:
+            continue
+        try:
+            ENGINE.resume(str(t["id"]))
+            resumed += 1
+        except Exception:
+            pass
+    if resumed:
+        print(f"[引擎] 已恢复 {resumed} 个未完成任务")
+
+
 # --------------------------------------------------------------------------- 统一任务操作
 
 
@@ -1165,7 +1199,9 @@ def _json_bytes(obj) -> bytes:
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    # 用 HTTP/1.0：每次请求一条新连接。keep-alive 下服务端回收空闲连接时，
+    # 浏览器可能仍在复用已被关闭的连接，fetch 就会报 Failed to fetch。
+    protocol_version = "HTTP/1.0"
     timeout = 60
 
     def log_message(self, fmt, *args):
@@ -1176,6 +1212,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             for k, v in CORS_HEADERS.items():
                 self.send_header(k, v)
             self.end_headers()
@@ -1370,7 +1407,8 @@ def start_gateway() -> None:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ShandianWin/1.0"
-    protocol_version = "HTTP/1.1"
+    # HTTP/1.0 + Connection: close，避免浏览器复用被服务端回收的空闲连接
+    protocol_version = "HTTP/1.0"
     timeout = 60
 
     def log_message(self, fmt, *args):
@@ -1382,6 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1432,14 +1471,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "task": task})
             elif path == "/api/add-many":
                 urls = body.get("urls") or []
-                added = 0
+                added, errors = 0, []
                 for u in urls:
                     try:
                         add_task(str(u))
                         added += 1
-                    except Exception:
-                        pass
-                self._json({"ok": True, "added": added})
+                    except Exception as exc:
+                        errors.append(str(exc))
+                self._json({"ok": True, "added": added, "errors": errors})
             elif path == "/api/action":
                 do_action(str(body.get("id", "")), str(body.get("action", "")))
                 self._json({"ok": True})
@@ -1604,6 +1643,7 @@ def main() -> None:
         set_launch_at_login(True)
     threading.Thread(target=clipboard_watcher, daemon=True).start()
     threading.Thread(target=schedule_worker, daemon=True).start()
+    threading.Thread(target=auto_resume_unfinished, daemon=True).start()
 
     if CONFIG.get("prevent_sleep"):
         try:
