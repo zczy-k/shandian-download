@@ -97,6 +97,6 @@ jobs:
           set -euo pipefail
           TAG="win-latest"
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" win/dist_installer/*.exe \
+          gh release create "$TAG" win/dist_installer/*.exe win/build/gopeed.exe \
             --title "Windows 安装包（最新构建）" \
             --notes "自动构建：SwiftUI 壳换成 Windows 客户端，复用打过补丁的 Gopeed 内核与 yt-dlp。下载 Setup exe 直接安装。"

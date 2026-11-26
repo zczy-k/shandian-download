@@ -70,9 +70,10 @@ def tool_path(name: str) -> Path | None:
     return None
 
 ENGINE_VERSION = "1.9.3"
+# 官方 release 的 Windows 包是 GUI 版，不接受 -A/-P/-T 无头参数；
+# 无头内核由本仓库的 GitHub Actions 用补丁源码编译，随 win-latest 一起发布
 GOPEED_URLS = [
-    f"https://github.com/GopeedLab/gopeed/releases/download/v{ENGINE_VERSION}/gopeed-v{ENGINE_VERSION}-windows-amd64.zip",
-    f"https://ghfast.top/https://github.com/GopeedLab/gopeed/releases/download/v{ENGINE_VERSION}/gopeed-v{ENGINE_VERSION}-windows-amd64.zip",
+    "https://github.com/zczy-k/shandian-download/releases/download/win-latest/gopeed.exe",
 ]
 YTDLP_URLS = [
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
@@ -195,13 +196,9 @@ def ensure_tools(need_ffmpeg: bool = False) -> None:
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 
     if tool_path(GOPEED_NAME) is None:
-        z = TOOLS_DIR / "gopeed.zip"
-        if not z.exists() or z.stat().st_size < 1024:
-            _download(GOPEED_URLS, z, "下载内核 Gopeed")
-        if z.exists() and z.stat().st_size > 1024:
-            if _unzip_one(z, "gopeed", TOOLS_DIR / GOPEED_NAME):
-                print(f"[工具] 内核就绪：{TOOLS_DIR / GOPEED_NAME}")
-            z.unlink(missing_ok=True)
+        dest = TOOLS_DIR / GOPEED_NAME
+        if _download(GOPEED_URLS, dest, "下载内核 Gopeed"):
+            print(f"[工具] 内核就绪：{dest}")
 
     if tool_path(YTDLP_NAME) is None:
         if _download(YTDLP_URLS, TOOLS_DIR / YTDLP_NAME, "视频组件 yt-dlp"):
