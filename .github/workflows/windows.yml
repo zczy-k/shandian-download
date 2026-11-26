@@ -1,0 +1,102 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "win/**"
+      - "engine/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: 编译打过补丁的 Gopeed 内核
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/gopeed-src"
+          git clone --depth 1 --branch v1.9.3 https://github.com/GopeedLab/gopeed.git "$SRC"
+          cd "$SRC"
+          git apply --verbose "$GITHUB_WORKSPACE/engine/shandian-gopeed-v1.9.3.patch"
+          mkdir -p cmd/web/dist
+          printf '<!doctype html><title>Shandian engine</title>' > cmd/web/dist/index.html
+          mkdir -p "$GITHUB_WORKSPACE/win/build"
+          export CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOFLAGS=-mod=mod
+          go build -tags web -trimpath -ldflags "-s -w" \
+            -o "$GITHUB_WORKSPACE/win/build/gopeed.exe" ./cmd/web
+          ls -lh "$GITHUB_WORKSPACE/win/build/gopeed.exe"
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 下载 yt-dlp 与图标
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd win
+          mkdir -p build
+          curl -sSL -o build/yt-dlp.exe https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe
+          pip install --quiet pyinstaller pillow
+          python - <<'PY'
+          from PIL import Image
+          img = Image.open("../docs/images/icon.png").convert("RGBA")
+          img.save("app.ico", sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          PY
+          ls -lh build/ app.ico
+
+      - name: 打包客户端
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd win
+          python -m PyInstaller shandian_win.spec --noconfirm --clean
+          mkdir -p dist/ShandianDownload/tools
+          cp build/gopeed.exe build/yt-dlp.exe dist/ShandianDownload/tools/
+          du -sh dist/ShandianDownload
+
+      - name: 生成安装程序
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd win
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$ISCC" ]; then
+            choco install innosetup -y --no-progress
+          fi
+          "$ISCC" installer.iss
+          ls -lh dist_installer/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shandian-Windows-Setup
+          path: win/dist_installer/*.exe
+          retention-days: 30
+
+      - name: 发布到 Release
+        if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="win-v0.22.6-$(date +%Y%m%d%H%M)"
+          gh release create "$TAG" win/dist_installer/*.exe \
+            --title "Windows 构建 $TAG" \
+            --notes "自动构建的 Windows 安装包（含打过补丁的 Gopeed 内核与 yt-dlp）"

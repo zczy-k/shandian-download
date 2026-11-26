@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>闪电全能下载</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M13.5 2 4 14h6l-1.5 8L20 9h-6.5l1-7z" fill="currentColor"/>
+    </svg>
+    <div>
+      <h1>闪电全能下载</h1>
+      <p class="sub">Windows 版 · 磁力 / 种子 / 直链 / 网盘 / 视频站</p>
+    </div>
+  </div>
+  <div class="status">
+    <span id="engine-dot" class="dot"></span>
+    <span id="engine-text">内核连接中…</span>
+  </div>
+</header>
+
+<section class="adder">
+  <input id="url" type="text" spellcheck="false"
+         placeholder="粘贴链接后回车：magnet: / .torrent / ed2k / HTTP 直链 / YouTube、B 站、抖音、小红书、微博页面">
+  <button id="add-btn" class="primary">添加</button>
+</section>
+<p class="hint" id="hint">视频站链接交给 yt-dlp，其余交给 Gopeed 内核</p>
+
+<main id="list" class="list"></main>
+<p id="empty" class="empty">还没有任务。复制一个链接粘到上面试试。</p>
+
+<footer class="footbar">
+  <div class="foot-item">
+    <span class="label">保存到</span>
+    <button id="dir-btn" class="ghost" title="点击打开目录">…</button>
+  </div>
+  <div class="foot-item">
+    <span class="label">分片并发</span>
+    <input id="concurrency" type="number" min="1" max="16" value="4">
+  </div>
+  <div class="foot-item">
+    <span class="label">Cookie 来源</span>
+    <select id="cookies">
+      <option value="">不读取</option>
+      <option value="chrome">Chrome</option>
+      <option value="edge">Edge</option>
+      <option value="firefox">Firefox</option>
+    </select>
+  </div>
+  <div class="foot-item grow"></div>
+  <div class="foot-item" id="tool-warn"></div>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

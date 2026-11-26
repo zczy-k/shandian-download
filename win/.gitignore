@@ -1,0 +1,10 @@
+tools/
+data/
+build/
+dist/
+dist_installer/
+config.json
+app.ico
+*.part
+*.spec.bak
+__pycache__/
