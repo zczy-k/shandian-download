@@ -12,7 +12,7 @@ let settingsDirty = false;
 let pendingPick = null;
 
 const STATUS_TEXT = {
-  waiting: '等待中', downloading: '下载中', paused: '已暂停', done: '已完成', error: '失败',
+  waiting: '排队中', downloading: '下载中', paused: '已暂停', done: '已完成', error: '失败',
 };
 
 /* ---------- 工具函数 ---------- */
@@ -89,7 +89,9 @@ function taskCard(t) {
 
   const pct = t.size > 0 ? Math.min(100, (t.downloaded / t.size) * 100)
     : (t.status === 'done' ? 100 : 0);
-  head.appendChild(el('span', 'pct', pct > 0 ? pct.toFixed(1) + '%' : (STATUS_TEXT[t.status] || '')));
+  let label = pct > 0 ? pct.toFixed(1) + '%' : (STATUS_TEXT[t.status] || '');
+  if (!pct && t.note && !t.size) label = '找种子中';
+  head.appendChild(el('span', 'pct', label));
   card.appendChild(head);
 
   const bar = el('div', 'bar');
@@ -100,16 +102,11 @@ function taskCard(t) {
 
   const meta = el('div', 'meta');
   const left = el('span', '');
-  const isMagnet = /^magnet:/i.test(t.name || '') || /^ed2k:/i.test(t.name || '');
-  const parsing = isMagnet && t.size === 0 && (t.status === 'waiting' || t.status === 'downloading');
   const bits = [];
-  if (parsing) {
-    bits.push('解析元数据中…（冷门资源可能需要几分钟）');
-  } else {
-    if (t.downloaded > 0) bits.push(fmtSize(t.downloaded) + (t.size > 0 ? ' / ' + fmtSize(t.size) : ''));
-    if (t.speed > 0) bits.push(fmtSpeed(t.speed));
-    if (!bits.length) bits.push(STATUS_TEXT[t.status] || '');
-  }
+  if (t.downloaded > 0) bits.push(fmtSize(t.downloaded) + (t.size > 0 ? ' / ' + fmtSize(t.size) : ''));
+  if (t.speed > 0) bits.push(fmtSpeed(t.speed));
+  if (t.note) bits.push(t.note);
+  if (!bits.length) bits.push(STATUS_TEXT[t.status] || '');
   left.textContent = bits.join(' · ');
   meta.appendChild(left);
 
@@ -326,7 +323,7 @@ function applyState(s) {
   const list = visibleTasks();
   const recycle = TAB === 'recycle' ? (s.recycle || []) : [];
   const sig = JSON.stringify([TAB, list.map(t => [t.id, t.status, t.name,
-    Math.round((t.downloaded / (t.size || 1)) * 1000), t.speed, t.error]), recycle.length]);
+    Math.round((t.downloaded / (t.size || 1)) * 1000), t.speed, t.error, t.note]), recycle.length]);
   if (sig === lastSig) return;
   lastSig = sig;
 

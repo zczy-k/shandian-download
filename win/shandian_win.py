@@ -65,7 +65,7 @@ GOPEED_NAME = "gopeed.exe"
 YTDLP_NAME = "yt-dlp.exe"
 FFMPEG_NAME = "ffmpeg.exe"
 
-APP_VERSION = "0.23.1"
+APP_VERSION = "0.23.2"
 GATEWAY_PORT = 6800
 UI_PORT = 8765
 
@@ -115,6 +115,8 @@ PAN_HOSTS = ["pan.baidu.com", "yun.baidu.com", "aliyundrive.com", "alipan.com",
              "cloud.189.cn", "115.com", "123pan.com", "mypikpak.com"]
 
 BTIH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
+BARE_HASH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
+TRACKER_CACHE: list[str] = []
 LINK_RE = re.compile(r"""(magnet:\?[^\s"'<>]+|ed2k://[^\s"'<>]+|https?://[^\s"'<>]+)""", re.I)
 
 
@@ -232,6 +234,35 @@ def validate_magnet(url: str) -> str | None:
             return (f"磁力链接的 btih 是 {len(h)} 位，标准应为 40 位十六进制或 32 位 base32。"
                     "链接多半是复制时漏了字符，请重新完整复制")
     return "磁力链接缺少 urn:btih 标识"
+
+
+def default_trackers() -> list[str]:
+    """公共 tracker 列表，进程内只拉一次。"""
+    global TRACKER_CACHE
+    if not TRACKER_CACHE:
+        try:
+            TRACKER_CACHE = fetch_trackers()
+        except Exception:
+            TRACKER_CACHE = []
+    return TRACKER_CACHE
+
+
+def normalize_bt_input(raw: str) -> str:
+    """裸 infohash 补成完整磁力；没有 tr= 的磁力补上公共 tracker。
+
+    只给 DHT 的磁力在老种子上经常「有元数据、零 Peer」，
+    补 tracker 能把这种情况的命中率拉起来（对齐 qBittorrent 的自动加 tracker 行为）。
+    """
+    s = raw.strip()
+    if BARE_HASH_RE.match(s):
+        s = "magnet:?xt=urn:btih:" + s
+    if not s.lower().startswith("magnet:?"):
+        return s
+    low = s.lower()
+    if "tr=" not in low:
+        for tr in default_trackers()[:24]:
+            s += "&tr=" + urllib.parse.quote(tr, safe="")
+    return s
 
 
 # --------------------------------------------------------------------------- 配置
@@ -586,6 +617,8 @@ class Engine:
         bt["listenPort"] = 6881
         trackers = fetch_trackers()
         if trackers:
+            global TRACKER_CACHE
+            TRACKER_CACHE = trackers
             bt["trackers"] = trackers
             print(f"[引擎] 已更新 {len(trackers)} 条 BT tracker")
         else:
@@ -601,34 +634,107 @@ class Engine:
 ENGINE = Engine()
 
 
+DISK_CACHE: dict[str, tuple[float, int]] = {}
+SPEED_SAMPLES: dict[str, tuple[float, int]] = {}
+PROGRESS_STATE: dict[str, dict] = {}
+PROGRESS_LOCK = threading.Lock()
+
+
+def dir_bytes(path: str) -> int:
+    """统计目录实际占用（4 秒缓存），用来兜底内核不上报的进度。"""
+    now = time.time()
+    with PROGRESS_LOCK:
+        hit = DISK_CACHE.get(path)
+        if hit and now - hit[0] < 4:
+            return hit[1]
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        total = 0
+    with PROGRESS_LOCK:
+        DISK_CACHE[path] = (now, total)
+    return total
+
+
 def engine_task_view(t: dict) -> dict:
     meta = t.get("meta") or {}
     res = meta.get("res") or {}
     files = res.get("files") or []
     size = res.get("size") or sum(int(f.get("size") or 0) for f in files)
+    size = int(size or 0)
     prog = t.get("progress") or {}
     status_raw = (t.get("status") or "").lower()
-    status = {"ready": "waiting", "waiting": "waiting", "running": "downloading",
-              "pause": "paused", "paused": "paused", "done": "done",
-              "error": "error"}.get(status_raw, status_raw or "waiting")
+    status = {"wait": "waiting", "ready": "waiting", "waiting": "waiting",
+              "running": "downloading", "pause": "paused", "paused": "paused",
+              "done": "done", "error": "error"}.get(status_raw, status_raw or "waiting")
     name = res.get("name") or t.get("name") or ""
     if not name:
         name = (meta.get("req") or {}).get("url", "").rstrip("/").rsplit("/", 1)[-1][:80] or "未命名任务"
+    tid = str(t.get("id"))
+
+    downloaded = int(prog.get("downloaded") or 0)
+    if downloaded <= 0 and t.get("protocol") == "bt" and size > 0:
+        # Gopeed 1.9.3 在部分 BT 任务上 downloaded 恒为 0，改看磁盘真实字节
+        base = (meta.get("opts") or {}).get("path") or CONFIG["download_dir"]
+        target = str(Path(base) / name) if name else base
+        on_disk = dir_bytes(target) if Path(target).exists() else dir_bytes(base)
+        if on_disk > 0:
+            downloaded = min(on_disk, size) if size else on_disk
+
+    speed = int(prog.get("speed") or 0) if status == "downloading" else 0
+    now = time.time()
+    if status == "downloading":
+        with PROGRESS_LOCK:
+            prev = SPEED_SAMPLES.get(tid)
+        if speed <= 0 and prev and now - prev[0] >= 1.5 and downloaded > prev[1]:
+            speed = int((downloaded - prev[1]) / (now - prev[0]))
+        if not prev or now - prev[0] >= 1.5:
+            with PROGRESS_LOCK:
+                SPEED_SAMPLES[tid] = (now, downloaded)
+
     return {
-        "id": str(t.get("id")),
+        "id": tid,
         "kind": "engine",
         "name": name,
         "status": status,
-        "downloaded": int(prog.get("downloaded") or 0),
-        "size": int(size or 0),
-        "speed": int(prog.get("speed") or 0) if status == "downloading" else 0,
+        "downloaded": downloaded,
+        "size": size,
+        "speed": speed,
         "dir": (meta.get("opts") or {}).get("path") or CONFIG["download_dir"],
         "error": t.get("shandianError") or None,
         "site": None,
         "protocol": t.get("protocol"),
         "created": t.get("createdAt") or "",
+        "note": None,
+        "_created": bool(t.get("isCreated")),
         "files": [{"name": f.get("name"), "size": f.get("size"), "path": f.get("path")} for f in files],
     }
+
+
+def annotate_stall(task: dict, meta_ready: bool) -> None:
+    """给「在跑但一动不动」的任务补一句人话，别让用户对着'下载中'发呆。"""
+    tid = task["id"]
+    now = time.time()
+    with PROGRESS_LOCK:
+        st = PROGRESS_STATE.setdefault(tid, {"bytes": -1, "ts": now})
+        if task["downloaded"] != st["bytes"]:
+            st["bytes"] = task["downloaded"]
+            st["ts"] = now
+        idle = now - st["ts"]
+    if task["status"] != "downloading" or task["speed"] > 0:
+        return
+    if not meta_ready:
+        if idle > 20:
+            task["note"] = "正在从 DHT / Tracker 找种子，暂时还没有 Peer 应答"
+        return
+    if idle > 40 and (not task["size"] or task["downloaded"] < task["size"]):
+        task["note"] = "等待做种：当前没有可连接的 Peer，速度会一直是 0"
 
 
 # --------------------------------------------------------------------------- 视频任务
@@ -996,6 +1102,7 @@ def add_task(url: str, directory: str | None = None, headers: dict | None = None
     url = url.strip()
     if not url:
         raise ValueError("链接为空")
+    url = normalize_bt_input(url)
     err = validate_magnet(url)
     if err:
         raise ValueError(err)
@@ -1039,6 +1146,9 @@ def snapshot() -> dict:
     tasks.sort(key=lambda t: t.get("created") or "", reverse=True)
     for t in tasks:
         t.pop("pid", None)
+        meta_ready = t.pop("_created", True)
+        if t.get("kind") == "engine":
+            annotate_stall(t, meta_ready)
     with LOCK:
         pending_clip = CLIP_STATE["pending"]
     return {
