@@ -1,5 +1,5 @@
 #define MyAppName "闪电全能下载"
-#define MyAppVersion "0.22.6"
+#define MyAppVersion "0.23.0"
 #define MyAppExeName "ShandianDownload.exe"
 
 [Setup]
