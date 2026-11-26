@@ -15,12 +15,15 @@ macOS 原版是 SwiftUI 壳（11082 行）+ Gopeed 内核 + yt-dlp。
 from __future__ import annotations
 
 import atexit
+import base64
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -65,7 +68,7 @@ GOPEED_NAME = "gopeed.exe"
 YTDLP_NAME = "yt-dlp.exe"
 FFMPEG_NAME = "ffmpeg.exe"
 
-APP_VERSION = "0.23.2"
+APP_VERSION = "0.23.3"
 GATEWAY_PORT = 6800
 UI_PORT = 8765
 
@@ -116,6 +119,7 @@ PAN_HOSTS = ["pan.baidu.com", "yun.baidu.com", "aliyundrive.com", "alipan.com",
 
 BTIH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
 BARE_HASH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
+BTIH_IN_URL_RE = re.compile(r"btih:([0-9a-zA-Z]{32,40})", re.IGNORECASE)
 TRACKER_CACHE: list[str] = []
 LINK_RE = re.compile(r"""(magnet:\?[^\s"'<>]+|ed2k://[^\s"'<>]+|https?://[^\s"'<>]+)""", re.I)
 
@@ -164,7 +168,7 @@ def link_kind(raw: str) -> str | None:
     except Exception:
         return None
     scheme = (u.scheme or "").lower()
-    if scheme not in ("http", "https", "ftp"):
+    if scheme not in ("http", "https"):
         return None
     host = (u.hostname or "").lower()
     if not host:
@@ -265,6 +269,121 @@ def normalize_bt_input(raw: str) -> str:
     return s
 
 
+def infohash_of(url: str) -> str:
+    m = BTIH_IN_URL_RE.search(url or "")
+    return m.group(1).upper() if m else ""
+
+
+def _bdecode(data: bytes, i: int = 0):
+    c = data[i:i + 1]
+    if c == b"i":
+        j = data.index(b"e", i)
+        return int(data[i + 1:j]), j + 1
+    if c == b"l":
+        i += 1
+        out = []
+        while data[i:i + 1] != b"e":
+            v, i = _bdecode(data, i)
+            out.append(v)
+        return out, i + 1
+    if c == b"d":
+        i += 1
+        out = {}
+        while data[i:i + 1] != b"e":
+            k, i = _bdecode(data, i)
+            v, i = _bdecode(data, i)
+            out[k] = v
+        return out, i + 1
+    if c.isdigit():
+        j = data.index(b":", i)
+        n = int(data[i:j])
+        s = j + 1
+        return data[s:s + n], s + n
+    raise ValueError("ben-code 解析失败")
+
+
+def torrent_meta(data: bytes) -> dict:
+    """解析 .torrent：算 infohash、取名字/trackers/总大小。
+
+    Gopeed 1.9.3 不认本地 .torrent 路径（提交成功但任务直接消失），
+    所以这里自己算 infohash 转成磁力再交给内核。
+    """
+    idx = data.find(b"4:infod")
+    if idx < 0:
+        raise ValueError("不是有效的 .torrent 文件")
+    start = idx + 6
+    i, depth, n = start, 1, len(data)
+    while i < n:
+        c = data[i:i + 1]
+        if c in (b"d", b"l"):
+            depth += 1
+            i += 1
+        elif c == b"e":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                break
+        elif c == b"i":
+            i = data.index(b"e", i) + 1
+        elif c.isdigit():
+            j = data.index(b":", i)
+            i = j + 1 + int(data[i:j])
+        else:
+            i += 1
+    raw = data[start:i - 1]
+    ih = hashlib.sha1(raw).hexdigest()
+
+    try:
+        root, _ = _bdecode(data, 0)
+    except Exception:
+        root = {}
+    info = root.get(b"info") or {}
+    name = (info.get(b"name") or b"").decode("utf-8", "replace")
+    trackers: list[str] = []
+    ann = root.get(b"announce")
+    if isinstance(ann, bytes) and ann:
+        trackers.append(ann.decode("utf-8", "replace"))
+    for tier in root.get(b"announce-list") or []:
+        for tr in tier or []:
+            if isinstance(tr, bytes):
+                s = tr.decode("utf-8", "replace")
+                if s and s not in trackers:
+                    trackers.append(s)
+    size = int(info.get(b"length") or 0)
+    if not size:
+        for f in info.get(b"files") or []:
+            try:
+                size += int(f.get(b"length") or 0)
+            except Exception:
+                pass
+    return {"infohash": ih, "name": name, "trackers": trackers, "size": size}
+
+
+def magnet_display_name(url: str) -> str:
+    """从磁力链接取出可读任务名，取不到就用 btih 前 12 位。"""
+    if not str(url).lower().startswith("magnet:?"):
+        return ""
+    try:
+        qs = urllib.parse.parse_qs(urlparse(url).query)
+    except Exception:
+        qs = {}
+    for key in ("dn", "xl"):
+        val = (qs.get(key) or [""])[0].strip()
+        if val:
+            return val[:120]
+    xt = (qs.get("xt") or [""])[0]
+    if "btih:" in xt.lower():
+        h = xt.split(":", 2)[-1].strip()
+        return f"磁力任务 · {h[:12].upper()}"
+    return "磁力任务"
+
+
+def looks_like_infohash(name: str) -> bool:
+    """内核在拿到元数据前会把任务名填成 infohash，这种名字要替换成人话。"""
+    s = str(name or "").strip()
+    return bool(re.fullmatch(r"[0-9A-Fa-f]{40}", s) or re.fullmatch(r"[A-Za-z2-7]{32}", s))
+
+
 # --------------------------------------------------------------------------- 配置
 
 
@@ -277,7 +396,7 @@ DEFAULT_CONFIG = {
     "last_movie": "",
     "last_video": "",
     "last_other": "",
-    "max_running": 3,
+    "max_running": 8,
     "limit_kb": 0,
     "concurrency": 4,
     "cookies_from_browser": "",
@@ -294,6 +413,9 @@ DEFAULT_CONFIG = {
     "schedule_to": 0,
     "auto_update_check": True,
     "auto_resume": True,
+    "bad_infohash": [],
+    "user_paused": [],
+    "name_hints": {},
     "recycle": [],
     "seen_version": "",
 }
@@ -301,6 +423,16 @@ DEFAULT_CONFIG = {
 LOCK = threading.RLock()
 VIDEO_TASKS: dict[str, dict] = {}
 PENDING: dict[str, dict] = {}
+PENDING_IH: dict[str, str] = {}   # pending id -> infohash，用于拦重复种子
+CANCELLED: set[str] = set()   # 已被用户删除、但内核提交仍在飞行中的 pending id
+LAST_TASKS: list[dict] = []   # 内核不可用时的兜底快照
+LAST_SUBMIT: dict = {"url": "", "ts": 0.0}   # 最近一次提交给内核的 URL，用于崩溃归因
+BAD_INFOHASH: set[str] = set()               # 会把内核对穿（panic）的 infohash，永不再提交
+FROZEN_SAMPLES: dict[str, list] = {}         # tid -> [last_downloaded, last_ts, healed_ts] 僵死检测
+HEAL_LOCK = threading.Lock()
+USER_PAUSED: set[str] = set()                # 用户亲手点过暂停的任务，任何自愈都不许动
+RESUME_TRIES: dict[str, float] = {}          # tid -> 上次自动接回时间，避免死循环
+NAME_HINTS: dict[str, str] = {}              # infohash -> 真名，元数据没下来前先用它显示
 CONFIG: dict = {}
 LAST_DIR_KIND = "other"
 
@@ -330,6 +462,12 @@ def save_config(cfg: dict | None = None) -> None:
         CONFIG_FILE.write_text(json.dumps(cfg or CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"[配置] 保存失败：{exc}")
+
+
+def _save_user_paused() -> None:
+    """把"用户亲手暂停"的任务 id 落盘，避免重启后被自愈逻辑偷偷继续下。"""
+    CONFIG["user_paused"] = sorted(USER_PAUSED)
+    save_config()
 
 
 def dir_for(kind: str) -> str:
@@ -426,6 +564,106 @@ class EngineError(RuntimeError):
     pass
 
 
+def _port_alive(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+            return True
+    except Exception:
+        return False
+
+
+def _port_owner_pids(port: int) -> list[int]:
+    """谁占着这个本地端口。Windows 走 netstat，别的系统走 lsof。"""
+    pids: list[int] = []
+    port = int(port)
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                                 text=True, timeout=8).stdout or ""
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(f":{port}"):
+                    try:
+                        pid = int(parts[-1])
+                    except ValueError:
+                        continue
+                    if pid and pid not in pids:
+                        pids.append(pid)
+        else:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True,
+                                 text=True, timeout=8).stdout or ""
+            pids = [int(x) for x in out.split() if x.isdigit()]
+    except Exception:
+        return []
+    return pids
+
+
+def _pids_by_name(name: str) -> list[int]:
+    """按映像名找 PID（Windows）。"""
+    pids: list[int] = []
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/FI", f"IMAGENAME eq {name}"],
+                             capture_output=True, timeout=10).stdout or b""
+    except Exception:
+        return []
+    text = out.decode("gbk", "replace")
+    for line in text.splitlines():
+        parts = [x.strip().strip('"') for x in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == name.lower():
+            try:
+                pids.append(int(parts[1]))
+            except ValueError:
+                pass
+    return pids
+
+
+def _proc_exe(pid: int) -> str:
+    """某个 PID 对应的可执行文件全路径，拿不到就返回空串。"""
+    if sys.platform != "win32":
+        return ""
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x0400 | 0x0010, False, int(pid))  # QUERY_INFORMATION | VM_READ
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            if ctypes.windll.psapi.GetModuleFileNameExW(h, None, buf, 1024):
+                return buf.value
+            return ""
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def kill_stale_engine() -> int:
+    """清掉上次残留的自家内核进程。
+
+    两个 gopeed 同时打开一个 bbolt 任务库，会把库写坏、任务全部消失——
+    这正是"关掉软件再打开，下载列表空了"的根因。
+    """
+    gopeed = tool_path(GOPEED_NAME)
+    if not gopeed:
+        return 0
+    target = os.path.normcase(os.path.abspath(str(gopeed)))
+    killed = 0
+    for pid in _pids_by_name(Path(gopeed).name):
+        if pid == os.getpid():
+            continue
+        exe = _proc_exe(pid)
+        if not exe or os.path.normcase(os.path.abspath(exe)) != target:
+            continue
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=8)
+            killed += 1
+        except Exception:
+            pass
+    if killed:
+        print(f"[引擎] 清掉 {killed} 个上次残留的内核进程")
+    return killed
+
+
 def fetch_trackers() -> list[str]:
     for src in TRACKER_SOURCES:
         try:
@@ -480,6 +718,8 @@ class Engine:
         except urllib.error.HTTPError as exc:
             raise EngineError(f"HTTP {exc.code}") from exc
         except Exception as exc:
+            # 连不上 = 内核进程已退出（或端口被回收）；不能再对外声称 alive
+            self.alive = False
             raise EngineError(str(exc)) from exc
         env = json.loads(raw) if raw else {}
         if env.get("code", 0) != 0:
@@ -496,11 +736,37 @@ class Engine:
         with self._lock:
             if self.alive:
                 return True
-            port = int(CONFIG.get("engine_port") or 0) or self._free_port()
+            port = int(CONFIG.get("engine_port") or 0)
+            if port and _port_alive(port) and self._adopt(port):
+                # 上次退出没把内核收拾干净：直接接管它，绝不另起一个抢同一个 data 目录。
+                # （两个 gopeed 同时打开一个 bbolt 文件会把任务库写坏，任务全消失）
+                return True
+            if not port:
+                port = self._free_port()
+            elif _port_alive(port):
+                for pid in _port_owner_pids(port):
+                    try:
+                        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                       capture_output=True, timeout=8)
+                    except Exception:
+                        pass
+                time.sleep(0.4)
+                if _port_alive(port):
+                    port = self._free_port()
+            CONFIG["engine_port"] = port
+            try:
+                save_config()
+            except Exception:
+                pass
             engine_data = DATA_DIR / "engine"
             engine_data.mkdir(parents=True, exist_ok=True)
             log_path = DATA_DIR / "engine.log"
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            if sys.platform == "win32":
+                kill_stale_engine()
+                if _port_alive(port):
+                    port = self._free_port()
+                    CONFIG["engine_port"] = port
             try:
                 self.proc = subprocess.Popen(
                     [str(gopeed), "-A", "127.0.0.1", "-P", str(port), "-T", self.token,
@@ -528,6 +794,21 @@ class Engine:
             print("[引擎] 启动超时，详见 data/engine.log")
             return False
 
+    def _adopt(self, port: int) -> bool:
+        """端口上已经有一个内核（上次残留的）时，用 token 认一下，能通就直接用。"""
+        old = self.port
+        self.port = int(port)
+        try:
+            info = self._req("GET", "info", timeout=2)
+        except Exception:
+            self.port = old
+            return False
+        self.alive = True
+        self.version = (info or {}).get("version")
+        self.apply_settings()
+        print(f"[引擎] 接管已在运行的内核 v{self.version} @ 127.0.0.1:{self.port}")
+        return True
+
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
             try:
@@ -545,11 +826,10 @@ class Engine:
 
     def create(self, url: str, directory: str, headers: dict | None = None,
                name: str | None = None, select_files: list[int] | None = None) -> str:
+        # 注意：Gopeed 1.9.3 收到 opts.name 会直接崩溃退出，名字只在 UI 层展示，绝不传给内核
         opts: dict = {"path": directory}
         if select_files:
             opts["selectFiles"] = select_files
-        if name:
-            opts["name"] = name
         req: dict = {"url": url}
         if url.lower().startswith("http") and headers:
             req["extra"] = {"header": headers}
@@ -564,11 +844,31 @@ class Engine:
             req["extra"] = {"header": headers}
         return self._req("POST", "resolve", {"req": req}, timeout=300) or {}
 
+    def _status_of(self, tid: str) -> str:
+        try:
+            for t in self.tasks():
+                if str(t.get("id")) == str(tid):
+                    return (t.get("status") or "").lower()
+        except Exception:
+            pass
+        return ""
+
     def pause(self, tid: str) -> None:
-        self._req("PUT", f"tasks/{tid}/pause")
+        try:
+            self._req("PUT", f"tasks/{tid}/pause")
+        except EngineError as exc:
+            # Gopeed 1.9.3 偶发在状态机上返回 task not found，实际已暂停，复查一次再决定
+            if "task not found" in str(exc) and self._status_of(tid) in ("pause", "paused", "done"):
+                return
+            raise
 
     def resume(self, tid: str) -> None:
-        self._req("PUT", f"tasks/{tid}/continue")
+        try:
+            self._req("PUT", f"tasks/{tid}/continue")
+        except EngineError as exc:
+            if "task not found" in str(exc) and self._status_of(tid) in ("running", "wait", "ready", "done"):
+                return
+            raise
 
     def delete(self, tid: str, with_files: bool = False) -> None:
         self._req("DELETE", f"tasks/{tid}?force={'true' if with_files else 'false'}")
@@ -602,7 +902,7 @@ class Engine:
             print(f"[引擎] 读取配置失败：{exc}")
             return
         cfg["downloadDir"] = CONFIG["download_dir"]
-        cfg["maxRunning"] = int(CONFIG.get("max_running") or 3)
+        cfg["maxRunning"] = int(CONFIG.get("max_running") or 8)
         extra = cfg.get("extra") or {}
         extra["shandianDownloadLimit"] = int(CONFIG.get("limit_kb") or 0)
         cfg["extra"] = extra
@@ -674,8 +974,25 @@ def engine_task_view(t: dict) -> dict:
               "running": "downloading", "pause": "paused", "paused": "paused",
               "done": "done", "error": "error"}.get(status_raw, status_raw or "waiting")
     name = res.get("name") or t.get("name") or ""
+    req_url = (meta.get("req") or {}).get("url") or ""
+    if not name or name.lower().startswith("magnet:?"):
+        name = magnet_display_name(req_url) or name
+    # 元数据没下来时内核只能给出 infohash，用我们加任务时记住的真名顶上
+    ih_now = infohash_of(req_url)
+    if ih_now and (not name or looks_like_infohash(name)):
+        hint = NAME_HINTS.get(ih_now)
+        if hint:
+            name = hint
+        elif not name or looks_like_infohash(name):
+            # 连 hint 都没有（纯 infohash 磁力）：别把 40 位哈希甩到界面上
+            name = f"未知种子 {ih_now[:8]}（等待种子信息）"
     if not name:
-        name = (meta.get("req") or {}).get("url", "").rstrip("/").rsplit("/", 1)[-1][:80] or "未命名任务"
+        name = req_url.rstrip("/").rsplit("/", 1)[-1][:80] or "未命名任务"
+    if ih_now and name and not looks_like_infohash(name) and not name.startswith("未知种子"):
+        # 元数据到手后内核会给出真名，顺手记下来，下次重启也不用再猜
+        if NAME_HINTS.get(ih_now) != name:
+            NAME_HINTS[ih_now] = name
+            CONFIG["name_hints"] = dict(list(NAME_HINTS.items())[-200:])
     tid = str(t.get("id"))
 
     downloaded = int(prog.get("downloaded") or 0)
@@ -730,10 +1047,16 @@ def annotate_stall(task: dict, meta_ready: bool) -> None:
     if task["status"] != "downloading" or task["speed"] > 0:
         return
     if not meta_ready:
-        if idle > 20:
+        if idle > 120:
+            task["note"] = ("一直拿不到种子信息：多半是当前网络封了 BT（DHT / UDP 被挡），"
+                            "换手机热点试试，或用直链下载同一个文件")
+        elif idle > 20:
             task["note"] = "正在从 DHT / Tracker 找种子，暂时还没有 Peer 应答"
         return
-    if idle > 40 and (not task["size"] or task["downloaded"] < task["size"]):
+    if idle > 120 and (not task["size"] or task["downloaded"] < task["size"]):
+        task["note"] = ("连不上 Peer，速度一直是 0：当前网络可能封了 BT（UDP / DHT 被挡），"
+                        "换网络，或改用直链下载")
+    elif idle > 40 and (not task["size"] or task["downloaded"] < task["size"]):
         task["note"] = "等待做种：当前没有可连接的 Peer，速度会一直是 0"
 
 
@@ -1065,6 +1388,17 @@ def auto_resume_unfinished() -> None:
     for t in tasks:
         if (t.get("status") or "").lower() not in ("pause", "paused"):
             continue
+        if str(t.get("id")) in USER_PAUSED:
+            continue
+        url = ((t.get("meta") or {}).get("req") or {}).get("url") or ""
+        ih = infohash_of(url)
+        if ih and ih in BAD_INFOHASH:
+            print(f"[引擎] 跳过崩溃元凶 {ih[:12]}（{str(t.get('name',''))[:24]}）")
+            try:
+                ENGINE.delete(str(t.get("id")), with_files=False)
+            except Exception:
+                pass
+            continue
         res = (t.get("meta") or {}).get("res") or {}
         size = int(res.get("size") or 0)
         done = int((t.get("progress") or {}).get("downloaded") or 0)
@@ -1079,17 +1413,200 @@ def auto_resume_unfinished() -> None:
         print(f"[引擎] 已恢复 {resumed} 个未完成任务")
 
 
+def heal_frozen() -> None:
+    """把「状态 running、但字节数长时间不动、速度恒 0」的 BT 任务踢一脚。
+
+    踩到过的真实场景：同一种子被加了两次，anacrolix/torrent 里两条任务抢同一批
+    文件锁，双双卡死在 0 速，pause/resume 也救不回来——只有重启内核算。
+    重启内核会把所有任务打断，代价太大，所以先做一次 pause→resume 尝试；
+    仍不动就留给用户手动处理，并在任务上打标提示。
+    """
+    now = time.time()
+    try:
+        raw = ENGINE.tasks()
+    except Exception:
+        return
+    seen: set[str] = set()
+    for t in raw:
+        tid = str(t.get("id") or "")
+        if not tid:
+            continue
+        st = (t.get("status") or "").lower()
+        if st in ("pause", "paused") and tid not in USER_PAUSED:
+            # 内核有时会自己把任务置成 paused（排队/内部异常），界面就永远卡"已暂停"。
+            # 用户没亲手暂停的，就直接接回来。
+            prog = t.get("progress") or {}
+            done = int(prog.get("downloaded") or 0)
+            size = int(((t.get("meta") or {}).get("res") or {}).get("size") or 0)
+            if size and done >= size:
+                continue
+            last_try = RESUME_TRIES.get(tid, 0.0)
+            if now - last_try < 60:
+                continue
+            RESUME_TRIES[tid] = now
+            try:
+                ENGINE.resume(tid)
+                print(f"[引擎] 任务 {tid[:10]} 被内核静默暂停，已自动接回")
+            except Exception:
+                pass
+            continue
+        if st != "running":
+            continue
+        if (t.get("protocol") or "") != "bt":
+            continue
+        tid = str(t.get("id") or "")
+        if not tid:
+            continue
+        seen.add(tid)
+        prog = t.get("progress") or {}
+        done = int(prog.get("downloaded") or 0)
+        speed = int(prog.get("speed") or 0)
+        if speed > 0:
+            with HEAL_LOCK:
+                FROZEN_SAMPLES.pop(tid, None)
+            continue
+        if done <= 0:
+            # 元数据阶段（DHT 找 peer）本来就是 0 字节 0 速，不算僵死
+            with HEAL_LOCK:
+                FROZEN_SAMPLES.pop(tid, None)
+            continue
+        with HEAL_LOCK:
+            rec = FROZEN_SAMPLES.get(tid)
+            if not rec or done != rec[0]:
+                FROZEN_SAMPLES[tid] = [done, now, (rec[2] if rec else 0.0)]
+                continue
+            frozen_for = now - rec[1]
+            healed_at = rec[2]
+            if frozen_for < 180 or now - healed_at < 600:
+                continue
+            rec[2] = now
+        print(f"[引擎] 任务 {tid[:10]} 已 {int(frozen_for)} 秒 0 速，尝试 pause→resume 唤醒")
+        try:
+            ENGINE.pause(tid)
+            time.sleep(1.5)
+            ENGINE.resume(tid)
+        except Exception as exc:
+            print(f"[引擎] 唤醒失败：{exc}")
+    with HEAL_LOCK:
+        for tid in list(FROZEN_SAMPLES):
+            if tid not in seen:
+                FROZEN_SAMPLES.pop(tid, None)
+
+
+def engine_guard() -> None:
+    """内核被外部杀掉或自己崩了之后，及时把 alive 状态纠正过来并自动拉起。
+
+    没有这个守护，"内核已死但界面还显示运行中"会让所有添加/暂停/删除全部报错。
+    另外负责崩溃归因：Gopeed 1.9.3 的 anacrolix/torrent 在拿到无效 infohash 时会
+    panic 整个进程，这里把凶手拉黑，避免"重启→自动恢复→再崩"的死循环。
+    """
+    crashes: list[float] = []
+    time.sleep(10)
+    while True:
+        ok = False
+        if ENGINE.alive:
+            try:
+                ENGINE._req("GET", "info", timeout=3)
+                ok = True
+            except Exception:
+                ok = False
+        if ok:
+            try:
+                heal_frozen()
+            except Exception:
+                pass
+            time.sleep(8)
+            continue
+
+        now = time.time()
+        with LOCK:
+            url = LAST_SUBMIT.get("url", "")
+            ts = float(LAST_SUBMIT.get("ts") or 0.0)
+        if url and 0 < now - ts < 20:
+            ih = infohash_of(url)
+            if ih:
+                BAD_INFOHASH.add(ih)
+                CONFIG["bad_infohash"] = sorted(BAD_INFOHASH)
+                try:
+                    save_config()
+                except Exception:
+                    pass
+                print(f"[引擎] 判定 infohash {ih[:12]} 会把内核打崩，已拉黑")
+
+        crashes = [c for c in crashes if now - c < 600] + [now]
+        print(f"[引擎] 内核已不可用，正在重启…（近 10 分钟第 {len(crashes)} 次）")
+
+        try:
+            ENGINE.stop()
+        except Exception:
+            pass
+        if ENGINE.start():
+            if len(crashes) < 2:
+                try:
+                    auto_resume_unfinished()
+                except Exception:
+                    pass
+            else:
+                print("[引擎] 近期多次崩溃，本次跳过自动恢复，避免死循环")
+            time.sleep(8)
+        else:
+            print("[引擎] 重启失败，20 秒后重试")
+            time.sleep(20)
+
+
 # --------------------------------------------------------------------------- 统一任务操作
+
+
+def find_duplicate(ih: str) -> dict | None:
+    """找出已经在列表（内核任务或待提交任务）里的同 infohash 任务。
+
+    内核侧不要出现两条同 infohash 的 BT 任务：它们会抢同一批文件，
+    实测会让两条一起永久 0 速。
+    """
+    ih = (ih or "").upper()
+    if not ih:
+        return None
+    try:
+        for t in ENGINE.tasks():
+            url = ((t.get("meta") or {}).get("req") or {}).get("url") or ""
+            if infohash_of(url) == ih:
+                return engine_task_view(t)
+    except Exception:
+        pass
+    with LOCK:
+        for pid, pih in PENDING_IH.items():
+            if pih == ih:
+                t = PENDING.get(pid)
+                if t:
+                    return dict(t)
+    return None
 
 
 def _submit_engine_task(pid: str, url: str, directory: str, headers: dict | None,
                         name: str | None, select_files: list[int] | None) -> None:
+    with LOCK:
+        LAST_SUBMIT["url"] = url
+        LAST_SUBMIT["ts"] = time.time()
     try:
-        ENGINE.create(url, directory, headers=headers, name=name, select_files=select_files)
+        tid = ENGINE.create(url, directory, headers=headers, name=name, select_files=select_files)
         with LOCK:
+            cancelled = pid in CANCELLED
+            CANCELLED.discard(pid)
             PENDING.pop(pid, None)
+            PENDING_IH.pop(pid, None)
+        if cancelled and tid:
+            # 用户在提交飞行中已经点了删除：内核那边刚建好，立刻清掉，别让卡片复活
+            try:
+                ENGINE.delete(str(tid), with_files=True)
+            except Exception:
+                try:
+                    ENGINE.delete(str(tid), with_files=False)
+                except Exception:
+                    pass
     except Exception as exc:
         with LOCK:
+            CANCELLED.discard(pid)
+            PENDING_IH.pop(pid, None)
             t = PENDING.get(pid)
             if t:
                 t["status"] = "error"
@@ -1098,7 +1615,8 @@ def _submit_engine_task(pid: str, url: str, directory: str, headers: dict | None
 
 
 def add_task(url: str, directory: str | None = None, headers: dict | None = None,
-             name: str | None = None, select_files: list[int] | None = None) -> dict:
+             name: str | None = None, select_files: list[int] | None = None,
+             size: int | None = None) -> dict:
     url = url.strip()
     if not url:
         raise ValueError("链接为空")
@@ -1107,40 +1625,118 @@ def add_task(url: str, directory: str | None = None, headers: dict | None = None
     if err:
         raise ValueError(err)
 
-    kind = link_kind(url) or "http"
+    kind = link_kind(url)
+    if kind is None:
+        if url.lower().endswith(".torrent"):
+            raise ValueError("种子文件不存在，请确认路径正确（也支持直接把 .torrent 文件拖进窗口）")
+        if re.fullmatch(r"[0-9a-fA-F]{8,64}", url):
+            raise ValueError(
+                f"磁力 infohash 长度不对（当前 {len(url)} 位）：应为 40 位十六进制或 32 位 Base32")
+        raise ValueError("无法识别的链接：只支持 http/https 直链、磁力(magnet:)、ed2k、以及本地 .torrent 文件")
+    ih = infohash_of(url)
+    if ih and ih in BAD_INFOHASH:
+        raise ValueError("这条磁力曾把下载内核打崩（infohash 无效或种子损坏），已列入黑名单不再提交，请换一个种子")
     if is_wechat_share(url):
         raise ValueError("微信视频号链接需要配合浏览器扩展使用：在扩展里点「下载这个视频」")
     if baidu_share_url(url):
         raise ValueError("百度网盘分享链接需要在浏览器扩展里选「用闪电下载」，或先安装 bdpan 后重试")
 
+    if kind == "torrent" and os.path.isfile(url):
+        try:
+            meta = torrent_meta(Path(url).read_bytes())
+        except Exception as exc:
+            raise ValueError(f"种子文件解析失败：{exc}")
+        name = name or meta["name"] or None
+        size = size or meta["size"] or None
+        magnet = "magnet:?xt=urn:btih:" + meta["infohash"].upper()
+        if meta["name"]:
+            magnet += "&dn=" + urllib.parse.quote(meta["name"])
+        # 老种子的 tracker 多半已经死了，把本机维护的活 tracker 一起带上，
+        # 否则只会一直"找 peer"却一个都连不上。
+        merged: list[str] = []
+        for tr in meta["trackers"] + list(TRACKER_CACHE):
+            if tr.startswith("udp://") or tr.startswith("http"):
+                if tr not in merged:
+                    merged.append(tr)
+        for tr in merged[:40]:
+            magnet += "&tr=" + urllib.parse.quote(tr, safe="")
+        url, kind = magnet, "magnet"
+        print(f"[种子] {meta['name'] or '(无名字)'} · {meta['infohash'][:12]} · "
+              f"{len(merged)} tracker（含本地 {len(TRACKER_CACHE)} 条）")
+
     if kind == "video":
         return add_video(url, directory or dir_for("video"))
+
+    # 同一个 infohash 重复提交给内核，会生成两条抢同一批文件的 BT 任务，
+    # 结果两条一起永久 0 速（实测：原任务从 7 MB/s 直接掉到 0 且再也起不来，
+    # 只有重启内核才恢复）。所以这里直接拦掉，把已有那条指给用户。
+    ih = infohash_of(url)
+    if ih:
+        dup = find_duplicate(ih)
+        if dup:
+            raise ValueError(
+                f"这个种子已经在列表里了（{str(dup.get('name') or '')[:40]}），"
+                f"直接看那条任务即可；重复添加会让两条任务一起卡在 0 速")
+
+    if kind == "magnet" and TRACKER_CACHE:
+        # 用户直接粘来的磁力经常只带一两个早就死掉的 tracker（有的还是一个都没有），
+        # 补上本机维护的活 tracker，否则在 DHT / UDP 被封的网络里一个 peer 都找不到，
+        # 界面上就表现为"一直 0 速、一直在找种子"。
+        have = {urllib.parse.unquote(x) for x in re.findall(r"[?&]tr=([^&]+)", url)}
+        added = 0
+        for tr in TRACKER_CACHE:
+            if added >= 30 or tr in have:
+                continue
+            if not (tr.startswith("udp://") or tr.startswith("http")):
+                continue
+            url += "&tr=" + urllib.parse.quote(tr, safe="")
+            added += 1
+        if added:
+            print(f"[磁力] 补上 {added} 条活 tracker")
 
     directory = directory or dir_for(kind)
     if not ENGINE.alive and not ENGINE.start():
         raise EngineError("下载内核未运行，无法添加该任务")
 
     pid = "p-" + uuid.uuid4().hex[:10]
+    display = name or magnet_display_name(url) or None
+    if ih and display and not looks_like_infohash(display) and NAME_HINTS.get(ih) != display:
+        NAME_HINTS[ih] = display
+        CONFIG["name_hints"] = dict(list(NAME_HINTS.items())[-200:])
+        try:
+            save_config()
+        except Exception:
+            pass
     task = {
-        "id": pid, "kind": "engine", "name": name or url, "status": "waiting",
-        "downloaded": 0, "size": 0, "speed": 0, "dir": directory, "error": None,
+        "id": pid, "kind": "engine", "name": display or url, "status": "waiting",
+        "downloaded": 0, "size": int(size or 0), "speed": 0, "dir": directory, "error": None,
         "site": None, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "files": [],
     }
     with LOCK:
         PENDING[pid] = task
+        if ih:
+            PENDING_IH[pid] = ih
     threading.Thread(target=_submit_engine_task,
-                     args=(pid, url, directory, headers, name, select_files), daemon=True).start()
+                     args=(pid, url, directory, headers, display, select_files), daemon=True).start()
     return dict(task)
 
 
 def snapshot() -> dict:
+    if ENGINE.alive and ENGINE.port and not _port_alive(ENGINE.port):
+        ENGINE.alive = False
     tasks: list[dict] = []
     if ENGINE.alive:
         try:
             tasks = [engine_task_view(t) for t in ENGINE.tasks()]
+            with LOCK:
+                LAST_TASKS[:] = [dict(t) for t in tasks]
         except Exception as exc:
             print(f"[引擎] 拉取任务失败：{exc}")
+            ENGINE.alive = False
     with LOCK:
+        if not tasks and LAST_TASKS:
+            # 内核暂时不可用：保留上次快照，别让用户看到任务凭空消失
+            tasks = [dict(t) for t in LAST_TASKS]
         tasks += [dict(t) for t in PENDING.values()]
         tasks += [dict(t) for t in VIDEO_TASKS.values()]
     tasks.sort(key=lambda t: t.get("created") or "", reverse=True)
@@ -1179,6 +1775,11 @@ def do_action(tid: str, action: str) -> None:
     if tid.startswith("p-"):
         with LOCK:
             PENDING.pop(tid, None)
+            PENDING_IH.pop(tid, None)
+            if action != "restore":
+                CANCELLED.add(tid)
+                if len(CANCELLED) > 500:
+                    CANCELLED.clear()
         return
     if tid.startswith("v-"):
         pid = None
@@ -1198,12 +1799,18 @@ def do_action(tid: str, action: str) -> None:
     if not ENGINE.alive:
         raise EngineError("下载内核未运行")
     if action == "pause":
+        USER_PAUSED.add(tid)
+        _save_user_paused()
         ENGINE.pause(tid)
     elif action == "resume":
+        USER_PAUSED.discard(tid)
+        _save_user_paused()
         ENGINE.resume(tid)
     elif action == "delete":
+        USER_PAUSED.discard(tid)
         ENGINE.delete(tid, with_files=False)
     elif action == "delete-file":
+        USER_PAUSED.discard(tid)
         ENGINE.delete(tid, with_files=True)
     elif action == "restore":
         pass
@@ -1501,9 +2108,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send(status, data or b"{}")
 
 
+class UiServer(ThreadingHTTPServer):
+    """Windows 上默认的 SO_REUSEADDR 允许两个进程绑同一个端口，
+    双开时请求会随机落到后启动那个（任务列表看起来"空了"）。这里强制独占。"""
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                pass
+        super().server_bind()
+
+
 def start_gateway() -> None:
     try:
-        httpd = ThreadingHTTPServer(("127.0.0.1", GATEWAY_PORT), GatewayHandler)
+        httpd = UiServer(("127.0.0.1", GATEWAY_PORT), GatewayHandler)
     except OSError as exc:
         print(f"[网关] 6800 绑定失败：{exc}")
         return
@@ -1589,6 +2212,24 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         errors.append(str(exc))
                 self._json({"ok": True, "added": added, "errors": errors})
+            elif path == "/api/add-torrent":
+                raw = str(body.get("data") or "")
+                if not raw:
+                    raise ValueError("没有收到种子文件内容")
+                try:
+                    blob = base64.b64decode(raw.split(",")[-1])
+                except Exception:
+                    raise ValueError("种子文件内容不是合法的 base64")
+                meta = torrent_meta(blob)
+                store = DATA_DIR / "torrents"
+                store.mkdir(parents=True, exist_ok=True)
+                safe = re.sub(r"[^\w.\-]", "_", str(body.get("name") or "upload.torrent"))[-80:]
+                fp = store / f"{uuid.uuid4().hex[:8]}-{safe}"
+                fp.write_bytes(blob)
+                task = add_task(str(fp), body.get("dir"), name=meta["name"] or None,
+                                size=meta["size"] or None)
+                self._json({"ok": True, "task": task, "infohash": meta["infohash"],
+                            "size": meta["size"]})
             elif path == "/api/action":
                 do_action(str(body.get("id", "")), str(body.get("action", "")))
                 self._json({"ok": True})
@@ -1661,7 +2302,7 @@ def _is_shandian(port: int) -> bool:
 def serve(preferred: int = UI_PORT) -> None:
     for candidate in range(preferred, preferred + 30):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", candidate), Handler)
+            httpd = UiServer(("127.0.0.1", candidate), Handler)
         except OSError:
             if _is_shandian(candidate):
                 ENGINE.stop()
@@ -1728,6 +2369,15 @@ def main() -> None:
         pass
 
     CONFIG = load_config()
+    for h in CONFIG.get("bad_infohash") or []:
+        if isinstance(h, str) and h:
+            BAD_INFOHASH.add(h.upper())
+    for tid in CONFIG.get("user_paused") or []:
+        if isinstance(tid, str) and tid:
+            USER_PAUSED.add(tid)
+    for ih, nm in (CONFIG.get("name_hints") or {}).items():
+        if isinstance(ih, str) and isinstance(nm, str) and nm:
+            NAME_HINTS[ih.upper()] = nm
 
     # 内核 token 持久化：LinkSwift / Gopeed 扩展代理都要用它，重启后不能变
     if not CONFIG.get("engine_token"):
@@ -1747,6 +2397,23 @@ def main() -> None:
     ENGINE.start()
     atexit.register(ENGINE.stop)
 
+    def _graceful(signum=None, frame=None) -> None:
+        """被关掉/被 kill 的时候先把内核收干净，别留孤儿进程去抢 bbolt 库。"""
+        try:
+            ENGINE.stop()
+        except Exception:
+            pass
+        try:
+            os._exit(0)
+        except Exception:
+            sys.exit(0)
+
+    for _sig in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        try:
+            signal.signal(getattr(signal, _sig), _graceful)
+        except Exception:
+            pass
+
     start_gateway()
     register_protocol()
     if CONFIG.get("launch_at_login"):
@@ -1754,6 +2421,7 @@ def main() -> None:
     threading.Thread(target=clipboard_watcher, daemon=True).start()
     threading.Thread(target=schedule_worker, daemon=True).start()
     threading.Thread(target=auto_resume_unfinished, daemon=True).start()
+    threading.Thread(target=engine_guard, daemon=True).start()
 
     if CONFIG.get("prevent_sleep"):
         try:

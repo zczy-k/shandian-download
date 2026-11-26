@@ -406,6 +406,26 @@ button.sm { padding: 4px 10px; font-size: 12px; }
 .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-size { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
 
+body.dragging {
+  outline: 3px dashed var(--accent);
+  outline-offset: -12px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+}
+body.dragging::after {
+  content: "松开鼠标，直接添加 .torrent 种子";
+  position: fixed;
+  left: 50%;
+  bottom: 96px;
+  transform: translateX(-50%);
+  padding: 10px 20px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  pointer-events: none;
+  z-index: 999;
+}
+
 @media (max-width: 700px) {
   body { padding: 0 14px 88px; }
   .footbar { display: none; }

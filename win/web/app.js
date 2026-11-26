@@ -200,7 +200,8 @@ async function add() {
       hint('解析元数据中…', '');
       let resolved = null;
       try {
-        resolved = await api('/api/resolve', { url }, 180000);
+        // 只等 8 秒：冷门种子可能要几分钟才拿到元数据，绝不能把添加按钮卡死
+        resolved = await api('/api/resolve', { url }, 8000);
       } catch (e) {
         resolved = null;
       }
@@ -355,6 +356,62 @@ async function poll() {
 
 addBtn.onclick = add;
 urlEl.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+
+/* ---------- 本地 .torrent 文件：按钮 + 整页拖拽 ---------- */
+
+const torrentBtn = $('torrent-btn');
+const torrentFile = $('torrent-file');
+
+async function addTorrentFile(file) {
+  if (!file) return;
+  if (!/\.torrent$/i.test(file.name || '')) {
+    hint('只能添加 .torrent 种子文件', 'bad');
+    return;
+  }
+  hint('正在读取种子文件…', '');
+  try {
+    const b64 = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ''));
+      r.onerror = () => reject(new Error('读取文件失败'));
+      r.readAsDataURL(file);
+    });
+    const j = await api('/api/add-torrent', { name: file.name, data: b64 }, 60000);
+    if (j.ok) {
+      const nm = (j.task && j.task.name) || file.name;
+      hint('已添加：' + nm, 'ok');
+      poll();
+    } else {
+      hint(j.error || '添加失败', 'bad');
+    }
+  } catch (e) {
+    hint('添加失败：' + e.message, 'bad');
+  }
+}
+
+if (torrentBtn && torrentFile) {
+  torrentBtn.onclick = () => torrentFile.click();
+  torrentFile.onchange = () => {
+    addTorrentFile(torrentFile.files[0]);
+    torrentFile.value = '';
+  };
+}
+
+['dragenter', 'dragover'].forEach(ev => document.addEventListener(ev, e => {
+  if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+    e.preventDefault();
+    document.body.classList.add('dragging');
+  }
+}));
+document.addEventListener('dragleave', e => {
+  if (!e.relatedTarget) document.body.classList.remove('dragging');
+});
+document.addEventListener('drop', e => {
+  document.body.classList.remove('dragging');
+  if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  Array.from(e.dataTransfer.files).forEach(f => addTorrentFile(f));
+});
 
 document.querySelectorAll('.tab').forEach(btn => {
   btn.onclick = () => {
