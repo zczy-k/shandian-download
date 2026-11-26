@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
@@ -106,10 +107,22 @@ DEFAULT_CONFIG = {
     "concurrency": 4,
     "cookies_from_browser": "",
     "engine_port": 0,
+    "max_running": 3,
 }
+
+# BT tracker 源，与 macOS 版 Engine.swift:357 一致，另加两个镜像应对国内网络
+TRACKER_SOURCES = [
+    "https://cf.trackerslist.com/best.txt",
+    "https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt",
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+    "https://ghfast.top/https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+]
+
+BTIH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
 
 LOCK = threading.Lock()
 VIDEO_TASKS: dict[str, dict] = {}
+PENDING: dict[str, dict] = {}  # 已受理、内核还没返回任务号的占位卡片
 CONFIG: dict = {}
 
 
@@ -221,6 +234,25 @@ class EngineError(RuntimeError):
     pass
 
 
+def fetch_trackers() -> list[str]:
+    """拉公开 tracker 列表。冷门磁力靠 tracker 找 peer，没有基本下不动。"""
+    for src in TRACKER_SOURCES:
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(src, timeout=8) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        out: list[str] = []
+        for line in text.splitlines():
+            t = line.strip()
+            if "announce" in t and t not in out:
+                out.append(t)
+        if out:
+            return out
+    return []
+
+
 class Engine:
     """托管 Gopeed headless，并按其 REST API 通信。
 
@@ -310,6 +342,7 @@ class Engine:
                     info = self._req("GET", "info", timeout=2)
                     self.alive = True
                     self.version = (info or {}).get("version")
+                    self.apply_settings()
                     print(f"[引擎] 已就绪 v{self.version} @ 127.0.0.1:{port}")
                     return True
                 except Exception:
@@ -335,7 +368,8 @@ class Engine:
         return self._req("GET", "tasks") or []
 
     def create(self, url: str, directory: str) -> str:
-        tid = self._req("POST", "tasks", {"req": {"url": url}, "opts": {"path": directory}})
+        # 磁力 / 种子要先从网络拿元数据，官方接口在这种情况下会等较久
+        tid = self._req("POST", "tasks", {"req": {"url": url}, "opts": {"path": directory}}, timeout=180)
         if not tid:
             raise EngineError("内核未返回任务编号")
         return str(tid)
@@ -351,6 +385,50 @@ class Engine:
 
     def resolve(self, url: str) -> dict:
         return self._req("POST", "resolve", {"req": {"url": url}}, timeout=300) or {}
+
+    # ---- 配置（对应 macOS 版 Engine.swift:326 applySettings）
+
+    def apply_settings(self) -> None:
+        try:
+            cfg = self._req("GET", "config") or {}
+        except Exception as exc:
+            print(f"[引擎] 读取配置失败：{exc}")
+            return
+
+        cfg["downloadDir"] = CONFIG["download_dir"]
+        cfg["maxRunning"] = int(CONFIG.get("max_running") or 3)
+
+        extra = cfg.get("extra") or {}
+        extra["shandianDownloadLimit"] = 0
+        cfg["extra"] = extra
+
+        # 全局代理关掉：开着时 BT 也走代理，磁力连不上 peer
+        cfg["proxy"] = {
+            "enable": False, "system": False, "scheme": "http",
+            "host": "127.0.0.1:7897", "usr": "", "pwd": "",
+        }
+
+        proto = cfg.get("protocolConfig") or {}
+        http = proto.get("http") or {}
+        http["connections"] = 8
+        http["userAgent"] = "ShandianDownload/0.22.6 (Windows)"
+        proto["http"] = http
+
+        bt = proto.get("bt") or {}
+        bt["listenPort"] = 6881  # 固定端口，别的节点才连得进来
+        trackers = fetch_trackers()
+        if trackers:
+            bt["trackers"] = trackers
+            print(f"[引擎] 已更新 {len(trackers)} 条 BT tracker")
+        else:
+            print("[引擎] tracker 列表拉取失败，沿用已有配置")
+        proto["bt"] = bt
+        cfg["protocolConfig"] = proto
+
+        try:
+            self._req("PUT", "config", cfg)
+        except Exception as exc:
+            print(f"[引擎] 写入配置失败：{exc}")
 
 
 ENGINE = Engine()
@@ -565,17 +643,77 @@ def add_video(url: str, directory: str | None = None) -> dict:
 # --------------------------------------------------------------------------- 统一操作
 
 
+def validate_magnet(url: str) -> str | None:
+    """磁力链接格式校验。返回错误文案，没问题返回 None。
+
+    复制不完整时 btih 会少字符（常见 39 位），内核只会回一句 unhandled xt parameter，
+    用户看到的是「加了任务但没反应」，所以在这里拦下来。
+    """
+    if not url.lower().startswith("magnet:"):
+        return None
+    q = url.split("?", 1)[1] if "?" in url else ""
+    xts = [part[3:] for part in q.split("&") if part.lower().startswith("xt=")]
+    if not xts:
+        return "磁力链接缺少 xt 参数，可能复制不完整"
+    for xt in xts:
+        xt = urllib.parse.unquote(xt)
+        if xt.lower().startswith("urn:btih:"):
+            h = xt[9:]
+            if BTIH_RE.match(h):
+                return None
+            return (
+                f"磁力链接的 btih 是 {len(h)} 位，标准应为 40 位十六进制或 32 位 base32。"
+                "链接多半是复制时漏了字符，请重新完整复制"
+            )
+    return "磁力链接缺少 urn:btih 标识"
+
+
+def _submit_engine_task(pid: str, url: str, directory: str) -> None:
+    """后台提交给内核。磁力要先从网络拿种子信息，可能几十秒，不能让 HTTP 请求等。"""
+    try:
+        ENGINE.create(url, directory)
+        with LOCK:
+            PENDING.pop(pid, None)  # 任务已进内核列表，占位卡片撤掉
+    except Exception as exc:
+        with LOCK:
+            t = PENDING.get(pid)
+            if t:
+                t["status"] = "error"
+                t["error"] = str(exc)
+        print(f"[引擎] 提交失败：{exc}")
+
+
 def add_task(url: str, directory: str | None = None) -> dict:
     url = url.strip()
     if not url:
         raise ValueError("链接为空")
+    magnet_error = validate_magnet(url)
+    if magnet_error:
+        raise ValueError(magnet_error)
     directory = directory or CONFIG["download_dir"]
     if is_video_url(url):
         return add_video(url, directory)
     if not ENGINE.alive and not ENGINE.start():
         raise EngineError("下载内核未运行，无法添加该任务")
-    tid = ENGINE.create(url, directory)
-    return {"id": tid, "kind": "engine", "name": url, "status": "waiting"}
+
+    pid = "p-" + uuid.uuid4().hex[:10]
+    task = {
+        "id": pid,
+        "kind": "engine",
+        "name": url,
+        "status": "waiting",
+        "downloaded": 0,
+        "size": 0,
+        "speed": 0,
+        "dir": directory,
+        "error": None,
+        "site": None,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with LOCK:
+        PENDING[pid] = task
+    threading.Thread(target=_submit_engine_task, args=(pid, url, directory), daemon=True).start()
+    return dict(task)
 
 
 def snapshot() -> dict:
@@ -586,6 +724,7 @@ def snapshot() -> dict:
         except Exception as exc:
             print(f"[引擎] 拉取任务失败：{exc}")
     with LOCK:
+        tasks += [dict(t) for t in PENDING.values()]
         tasks += [dict(t) for t in VIDEO_TASKS.values()]
     tasks.sort(key=lambda t: t.get("created") or "", reverse=True)
     for t in tasks:
@@ -606,6 +745,11 @@ def snapshot() -> dict:
 
 
 def do_action(tid: str, action: str) -> None:
+    if tid.startswith("p-"):
+        with LOCK:
+            PENDING.pop(tid, None)
+        return
+
     if tid.startswith("v-"):
         pid = None
         with LOCK:
@@ -668,17 +812,22 @@ def open_path(tid: str) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ShandianWin/1.0"
+    protocol_version = "HTTP/1.1"  # 浏览器复用连接，减少每次点按都重新握手
+    timeout = 60                   # 空闲连接 60 秒回收，避免线程堆积
 
-    def log_message(self, fmt, *args):  # 静音
+    def log_message(self, fmt, *args):  # 静音默认日志
         pass
 
     def _send(self, status: int, body: bytes, ctype: str = "application/json; charset=utf-8") -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # 浏览器提前关页面，不算错误
 
     def _json(self, obj, status: int = 200) -> None:
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
@@ -693,15 +842,23 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            self._static("index.html")
-        elif path == "/api/state":
-            self._json(snapshot())
-        elif path.startswith("/static/"):
-            self._static(path[8:])
-        else:
-            self._json({"error": "not found"}, 404)
+        try:
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                self._static("index.html")
+            elif path == "/api/state":
+                self._json(snapshot())
+            elif path == "/api/ping":
+                self._json({"ok": True, "app": "shandian-win"})
+            elif path.startswith("/static/"):
+                self._static(path[8:])
+            else:
+                self._json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as exc:
+            print(f"[HTTP] GET {self.path} 失败：{exc}")
+            self._json({"ok": False, "error": str(exc)}, 500)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -733,7 +890,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "msg": "开始下载 ffmpeg，完成前视频合并会失败"})
             else:
                 self._json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
         except Exception as exc:
+            print(f"[HTTP] POST {path} 失败：{exc}")
             self._json({"ok": False, "error": str(exc)}, 400)
 
     def _static(self, rel: str) -> None:
@@ -751,17 +911,39 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), ctype)
 
 
-def serve(port: int = 8765) -> None:
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}/"
-    print(f"[界面] {url}")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+def _is_shandian(port: int) -> bool:
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        httpd.server_close()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/api/ping", timeout=0.4) as r:
+            return json.loads(r.read() or b"{}").get("app") == "shandian-win"
+    except Exception:
+        return False
+
+
+def serve(preferred: int = 8765) -> None:
+    for candidate in range(preferred, preferred + 30):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", candidate), Handler)
+        except OSError:
+            # 端口被占：如果是自己已经开着的实例，直接把浏览器指过去，不再起第二个内核
+            if _is_shandian(candidate):
+                ENGINE.stop()  # 本进程刚拉起的多余内核退掉
+                url = f"http://127.0.0.1:{candidate}/"
+                print(f"[界面] 已有实例在运行，打开 {url}")
+                webbrowser.open(url)
+                return
+            continue
+        url = f"http://127.0.0.1:{candidate}/"
+        print(f"[界面] {url}")
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+        return
+    print("[界面] 8765-8794 都被占用，未启动界面")
 
 
 def main() -> None:
@@ -785,14 +967,7 @@ def main() -> None:
     ensure_tools(need_ffmpeg=False)
     ENGINE.start()
     atexit.register(ENGINE.stop)
-
-    port = 8765
-    for candidate in range(8765, 8795):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", candidate)) != 0:
-                port = candidate
-                break
-    serve(port)
+    serve(8765)
 
 
 if __name__ == "__main__":

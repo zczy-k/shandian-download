@@ -58,9 +58,15 @@ function renderTask(t) {
   const meta = el('div', 'meta');
   const left = el('span', '');
   const bits = [];
-  if (t.downloaded > 0) bits.push(fmtSize(t.downloaded) + (t.size > 0 ? ' / ' + fmtSize(t.size) : ''));
-  if (t.speed > 0) bits.push(fmtSpeed(t.speed));
-  if (bits.length === 0) bits.push(STATUS_TEXT[t.status] || '');
+  const isMagnet = /^magnet:/i.test(t.name || '') || /^ed2k:/i.test(t.name || '');
+  const parsingMeta = isMagnet && t.size === 0 && (t.status === 'waiting' || t.status === 'downloading');
+  if (parsingMeta) {
+    bits.push('解析元数据中…（磁力冷门资源可能需要几分钟）');
+  } else {
+    if (t.downloaded > 0) bits.push(fmtSize(t.downloaded) + (t.size > 0 ? ' / ' + fmtSize(t.size) : ''));
+    if (t.speed > 0) bits.push(fmtSpeed(t.speed));
+    if (bits.length === 0) bits.push(STATUS_TEXT[t.status] || '');
+  }
   left.textContent = bits.join(' · ');
   meta.appendChild(left);
 
@@ -86,14 +92,29 @@ function renderTask(t) {
   return card;
 }
 
-async function act(id, action) {
+async function api(path, body, timeoutMs = 90000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch('/api/action', {
+    const r = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, action }),
+      body: JSON.stringify(body || {}),
+      signal: ctrl.signal,
     });
-    const j = await r.json();
+    const text = await r.text();
+    return text ? JSON.parse(text) : {};
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + ' 秒）');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function act(id, action) {
+  try {
+    const j = await api('/api/action', { id, action }, 30000);
     if (!j.ok) toast(j.error || '操作失败');
     poll();
   } catch (e) {
@@ -102,11 +123,11 @@ async function act(id, action) {
 }
 
 async function openDir(id) {
-  await fetch('/api/open', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id }),
-  });
+  try {
+    await api('/api/open', { id }, 15000);
+  } catch (e) {
+    toast('打开目录失败：' + e.message);
+  }
 }
 
 async function add() {
@@ -115,16 +136,12 @@ async function add() {
   addBtn.disabled = true;
   addBtn.textContent = '添加中…';
   try {
-    const r = await fetch('/api/add', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-    });
-    const j = await r.json();
+    const j = await api('/api/add', { url }, 90000);
     if (j.ok) {
       urlEl.value = '';
-      hintEl.textContent = '已添加：' + (j.task.name || url);
+      hintEl.textContent = '已添加，正在解析';
       hintEl.className = 'hint ok';
+      poll();
     } else {
       hintEl.textContent = j.error || '添加失败';
       hintEl.className = 'hint bad';
@@ -135,7 +152,6 @@ async function add() {
   } finally {
     addBtn.disabled = false;
     addBtn.textContent = '添加';
-    poll();
   }
 }
 
@@ -188,12 +204,16 @@ function applyState(s) {
 }
 
 async function poll() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const r = await fetch('/api/state');
+    const r = await fetch('/api/state', { signal: ctrl.signal, cache: 'no-store' });
     applyState(await r.json());
   } catch (e) {
     $('engine-dot').className = 'dot off';
     $('engine-text').textContent = '界面与后端断开';
+  } finally {
+    clearTimeout(timer);
   }
 }
 
